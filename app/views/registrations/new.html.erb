@@ -1,0 +1,29 @@
+<% content_for :title, "Create account · Tangochou" %>
+<div class="auth-screen">
+  <div class="auth-card">
+    <div class="brand"><span class="brand-jp">単語帳</span><span class="brand-en">Tangochou</span></div>
+    <h1>はじめまして</h1>
+    <p class="auth-sub">Create an account to start your own deck.</p>
+
+    <% if @user&.errors&.any? %>
+      <ul class="form-error-list">
+        <% @user.errors.full_messages.each do |msg| %><li><%= msg %></li><% end %>
+      </ul>
+    <% end %>
+
+    <%= form_with url: signup_path, method: :post, local: true, class: "auth-form" do %>
+      <div class="field">
+        <label for="email">Email</label>
+        <%= email_field_tag :email, params[:email], id: "email", required: true, autofocus: true, autocomplete: "email" %>
+      </div>
+      <div class="field">
+        <label for="password">Password</label>
+        <%= password_field_tag :password, nil, id: "password", required: true, minlength: 8, autocomplete: "new-password" %>
+        <p class="field-hint">At least 8 characters.</p>
+      </div>
+      <%= submit_tag "Create account", class: "btn btn-primary btn-block" %>
+    <% end %>
+
+    <p class="auth-switch">Already have an account? <%= link_to "Sign in", login_path %></p>
+  </div>
+</div>

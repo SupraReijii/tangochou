@@ -1,0 +1,25 @@
+<% content_for :title, "Sign in · Tangochou" %>
+<div class="auth-screen">
+  <div class="auth-card">
+    <div class="brand"><span class="brand-jp">単語帳</span><span class="brand-en">Tangochou</span></div>
+    <h1>おかえりなさい</h1>
+    <p class="auth-sub">Sign in to your vocabulary deck.</p>
+
+    <% if flash[:alert] %><p class="form-error"><%= flash[:alert] %></p><% end %>
+    <% if flash[:notice] %><p class="form-notice"><%= flash[:notice] %></p><% end %>
+
+    <%= form_with url: login_path, method: :post, local: true, class: "auth-form" do %>
+      <div class="field">
+        <label for="email">Email</label>
+        <%= email_field_tag :email, params[:email], id: "email", required: true, autofocus: true, autocomplete: "email" %>
+      </div>
+      <div class="field">
+        <label for="password">Password</label>
+        <%= password_field_tag :password, nil, id: "password", required: true, autocomplete: "current-password" %>
+      </div>
+      <%= submit_tag "Sign in", class: "btn btn-primary btn-block" %>
+    <% end %>
+
+    <p class="auth-switch">New here? <%= link_to "Create an account", signup_path %></p>
+  </div>
+</div>
