@@ -23,6 +23,10 @@
     autoImageStatus: null,
     autoImageToken: 0,
     lastAutoImageQuery: null,
+    imageSuggestions: null,
+    selectedSuggestionIndex: null,
+    suggestionBusyIndex: null,
+    suggestionSelectToken: 0,
     filterTag: "all",
     dueOnly: true,
     autoKana: readLocal("tangochou_autokana", true),
@@ -253,26 +257,41 @@
 
   function renderImgDropHTML() {
     var img = state.pendingImage;
+    var dropHtml;
     if (img) {
-      return (
+      dropHtml =
         '<div class="img-drop has-image" id="img-drop">' +
           '<img src="' + esc(img.url) + '" alt="">' +
           (img.auto ? '<span class="img-auto-badge">auto</span>' : '') +
           '<button type="button" class="img-remove" data-action="remove-image" title="Remove image">✕</button>' +
-        '</div>'
-      );
-    }
-    if (state.autoImageStatus) {
+        '</div>';
+    } else if (state.autoImageStatus) {
       var label = state.autoImageStatus === "searching" ? "Finding…" : "Drawing…";
-      return '<div class="img-drop is-busy" id="img-drop"><span class="img-drop-spinner"></span><span class="img-drop-caption">' + label + '</span></div>';
+      dropHtml = '<div class="img-drop is-busy" id="img-drop"><span class="img-drop-spinner"></span><span class="img-drop-caption">' + label + '</span></div>';
+    } else {
+      dropHtml = '<div class="img-drop" id="img-drop">Add photo<input type="file" accept="image/*" id="image-input"></div>';
     }
-    return (
-      '<div class="img-drop" id="img-drop">' +
-        'Add photo' +
-        '<input type="file" accept="image/*" id="image-input">' +
-      '</div>' +
-      '<div class="img-drop-hint">or auto-fills from your word</div>'
-    );
+
+    var suggestionsHtml = renderSuggestionThumbsHTML();
+    var hint = (!img && !state.autoImageStatus) ?
+      '<div class="img-drop-hint">' + (suggestionsHtml ? "Tap a suggestion, or upload your own" : "Type a word to auto-fill, or upload your own") + '</div>' : "";
+
+    return '<div class="img-picker">' + dropHtml + suggestionsHtml + '</div>' + hint;
+  }
+
+  function renderSuggestionThumbsHTML() {
+    if (!state.imageSuggestions || !state.imageSuggestions.length) return "";
+    return state.imageSuggestions.map(function (sug, i) {
+      var selected = state.selectedSuggestionIndex === i;
+      var busy = state.suggestionBusyIndex === i;
+      var label = sug.type === "generated" ? "Generated tile" : ("Photo: " + sug.title);
+      return (
+        '<button type="button" class="suggestion-thumb' + (selected ? ' selected' : '') + '" data-action="select-suggestion" data-index="' + i + '" title="' + esc(label) + '">' +
+          '<img src="' + esc(sug.previewUrl) + '" alt="" loading="lazy">' +
+          (busy ? '<span class="suggestion-busy-overlay"><span class="img-drop-spinner"></span></span>' : '') +
+        '</button>'
+      );
+    }).join("");
   }
 
   function refreshImgDropOnly() {
@@ -459,6 +478,7 @@
       return uploadImage(blob);
     }).then(function (res) {
       state.pendingImage = { id: res.id, url: res.url };
+      state.selectedSuggestionIndex = null;
       render();
     }).catch(function (err) {
       toast("Couldn't upload image: " + err.message);
@@ -513,33 +533,44 @@
   }
 
   // Wikipedia's MediaWiki API is public, keyless, and CORS-enabled via
-  // origin=*. Two calls: find the best-matching article, then its lead image.
-  function fetchWikipediaThumbnail(query) {
+  // origin=*. Two calls: find several matching articles, then their lead
+  // images, so the user gets a handful of real-photo options to pick from.
+  function fetchWikipediaSuggestions(query, limit) {
     var signal = AbortSignal.timeout ? AbortSignal.timeout(8000) : undefined;
-    var searchUrl = "https://en.wikipedia.org/w/api.php?action=query&list=search&format=json&origin=*&srlimit=1&srsearch=" + encodeURIComponent(query);
+    var searchUrl = "https://en.wikipedia.org/w/api.php?action=query&list=search&format=json&origin=*&srlimit=" + limit + "&srsearch=" + encodeURIComponent(query);
     return fetch(searchUrl, { signal: signal }).then(function (r) { return r.json(); }).then(function (data) {
-      var hit = data.query && data.query.search && data.query.search[0];
-      if (!hit) return null;
-      var imgUrl = "https://en.wikipedia.org/w/api.php?action=query&prop=pageimages&piprop=thumbnail&pithumbsize=700&format=json&origin=*&titles=" + encodeURIComponent(hit.title);
+      var titles = ((data.query && data.query.search) || []).map(function (h) { return h.title; });
+      if (!titles.length) return [];
+      var imgUrl = "https://en.wikipedia.org/w/api.php?action=query&prop=pageimages&piprop=thumbnail&pithumbsize=300&format=json&origin=*&titles=" + encodeURIComponent(titles.join("|"));
       return fetch(imgUrl, { signal: signal }).then(function (r) { return r.json(); }).then(function (data2) {
-        var pages = data2.query && data2.query.pages;
-        var page = pages && Object.values(pages)[0];
-        return (page && page.thumbnail && page.thumbnail.source) || null;
+        var pages = (data2.query && data2.query.pages) || {};
+        var thumbByTitle = {};
+        Object.keys(pages).forEach(function (k) {
+          var p = pages[k];
+          if (p && p.thumbnail && p.thumbnail.source) thumbByTitle[p.title] = p.thumbnail.source;
+        });
+        return titles.filter(function (t) { return thumbByTitle[t]; })
+          .map(function (t) { return { title: t, thumbUrl: thumbByTitle[t] }; });
       });
     });
   }
 
-  function fetchWikipediaImageBlob(query) {
-    return fetchWikipediaThumbnail(query).then(function (thumbUrl) {
-      if (!thumbUrl) return null;
-      var signal = AbortSignal.timeout ? AbortSignal.timeout(8000) : undefined;
-      return fetch(thumbUrl, { signal: signal }).then(function (r) { return r.ok ? r.blob() : null; });
+  function fetchImageBlob(url) {
+    var signal = AbortSignal.timeout ? AbortSignal.timeout(8000) : undefined;
+    return fetch(url, { signal: signal }).then(function (r) { return r.ok ? r.blob() : null; }).catch(function () { return null; });
+  }
+
+  function revokeSuggestionPreviews(suggestions) {
+    (suggestions || []).forEach(function (sug) {
+      if (sug.type === "generated" && sug.previewUrl) URL.revokeObjectURL(sug.previewUrl);
     });
   }
 
-  // Automatically fills the card image once both words are present: tries a
-  // real photo for the meaning first, then a generated minimalist tile.
-  // Never overwrites a manually-picked or already-fetched image.
+  // Looks up a handful of candidate images once both words are present: a
+  // few real photos matching the meaning, plus a generated minimalist tile
+  // as a fallback option. The best match is pre-selected, but the user can
+  // tap any suggestion to swap it in. Never overwrites a manually-picked
+  // image.
   function autoFillImage() {
     var jp = (document.getElementById("f-jp") || {}).value || "";
     var meaning = (document.getElementById("f-meaning") || {}).value || "";
@@ -554,28 +585,70 @@
     var token = ++state.autoImageToken;
     var stale = function () { return token !== state.autoImageToken; };
 
+    revokeSuggestionPreviews(state.imageSuggestions);
+    state.imageSuggestions = null;
+    state.selectedSuggestionIndex = null;
     state.autoImageStatus = "searching";
     refreshImgDropOnly();
 
-    var search = meaning ? fetchWikipediaImageBlob(meaning).catch(function () { return null; }) : Promise.resolve(null);
+    var search = meaning ? fetchWikipediaSuggestions(meaning, 5).catch(function () { return []; }) : Promise.resolve([]);
 
-    search.then(function (blob) {
-      if (stale()) return;
-      if (blob) return resizeImage(blob, 900, 0.85);
-      state.autoImageStatus = "generating";
-      refreshImgDropOnly();
-      return generateMinimalistImage(jp);
-    }).then(function (finalBlob) {
-      if (stale() || !finalBlob) return;
-      return uploadImage(finalBlob).then(function (res) {
-        if (stale()) return;
-        state.pendingImage = { id: res.id, url: res.url, auto: true };
+    search.then(function (hits) {
+      if (stale()) return null;
+      var suggestions = hits.map(function (h) {
+        return { type: "photo", title: h.title, thumbUrl: h.thumbUrl, previewUrl: h.thumbUrl, blob: null };
       });
+      return generateMinimalistImage(jp).then(function (blob) {
+        if (!stale()) suggestions.push({ type: "generated", japanese: jp, previewUrl: URL.createObjectURL(blob), blob: blob });
+        return suggestions;
+      }).catch(function () { return suggestions; });
+    }).then(function (suggestions) {
+      if (stale() || !suggestions) return;
+      state.imageSuggestions = suggestions;
+      state.autoImageStatus = null;
+      refreshImgDropOnly();
+      if (suggestions.length) selectSuggestion(0);
     }).catch(function () {
       // Silent: manual upload is always still available.
     }).then(function () {
       if (stale()) return;
       state.autoImageStatus = null;
+    });
+  }
+
+  // Fetches (or reuses a cached) blob for one suggestion and uploads it as
+  // the card's image. Guards against races with a fresh word edit by
+  // snapshotting the auto-image token and bailing if it moves on.
+  function selectSuggestion(index) {
+    var sug = state.imageSuggestions && state.imageSuggestions[index];
+    if (!sug) return;
+    var imageToken = state.autoImageToken;
+    var selToken = ++state.suggestionSelectToken; // last click wins over an in-flight one
+    var stale = function () { return imageToken !== state.autoImageToken || selToken !== state.suggestionSelectToken; };
+
+    state.suggestionBusyIndex = index;
+    refreshImgDropOnly();
+
+    var blobPromise = sug.blob ? Promise.resolve(sug.blob) :
+      sug.type === "generated" ? generateMinimalistImage(sug.japanese) :
+      fetchImageBlob(sug.thumbUrl).then(function (b) {
+        if (!b) throw new Error("no image");
+        return resizeImage(b, 900, 0.85);
+      });
+
+    blobPromise.then(function (blob) {
+      sug.blob = blob;
+      if (stale()) return null;
+      return uploadImage(blob);
+    }).then(function (res) {
+      if (stale() || !res) return;
+      state.pendingImage = { id: res.id, url: res.url, auto: true };
+      state.selectedSuggestionIndex = index;
+    }).catch(function () {
+      if (!stale()) toast("Couldn't use that photo — try another.");
+    }).then(function () {
+      if (stale()) return;
+      state.suggestionBusyIndex = null;
       refreshImgDropOnly();
     });
   }
@@ -595,6 +668,10 @@
     state.autoImageToken += 1;
     state.autoImageStatus = null;
     state.lastAutoImageQuery = null;
+    revokeSuggestionPreviews(state.imageSuggestions);
+    state.imageSuggestions = null;
+    state.selectedSuggestionIndex = null;
+    state.suggestionBusyIndex = null;
   }
 
   function resizeImage(file, maxDim, quality) {
@@ -694,7 +771,8 @@
     else if (action === "exit-study") { endStudy(); }
     else if (action === "reveal") { state.study.revealed = true; render(); }
     else if (action === "grade") { submitGrade(btn.getAttribute("data-grade")); }
-    else if (action === "remove-image") { state.pendingImage = null; state.autoImageToken += 1; render(); }
+    else if (action === "remove-image") { state.pendingImage = null; state.selectedSuggestionIndex = null; state.autoImageToken += 1; render(); }
+    else if (action === "select-suggestion") { selectSuggestion(parseInt(btn.getAttribute("data-index"), 10)); }
     else if (action === "sign-out") { signOut(); }
     else if (action === "edit-card") {
       var id = btn.getAttribute("data-id");
