@@ -533,25 +533,92 @@
   }
 
   // Wikipedia's MediaWiki API is public, keyless, and CORS-enabled via
-  // origin=*. Two calls: find several matching articles, then their lead
-  // images, so the user gets a handful of real-photo options to pick from.
+  // origin=*. A plain full-text search (the old approach) matches any
+  // article that merely *mentions* the word — e.g. searching "bat" surfaced
+  // "Meat Loaf" (his "Bat Out of Hell" album) and "glass" surfaced "Philip
+  // Glass" (the composer). Two tiers fix that:
+  //   1. the word's own canonical article, redirects resolved — the single
+  //      most reliable match for concrete vocabulary ("dog" -> Dog).
+  //   2. "intitle:" search, which only matches pages actually named after
+  //      the word, to fill any remaining suggestion slots.
+  // Disambiguation pages and "List of ..." pages are filtered out of both.
+  // "intitle:" also matches via redirects though (searching "onigiri" can
+  // surface "Senbei" because some unrelated cracker variety redirects from
+  // a title containing the word) — a final check that the word actually
+  // appears in the *returned* title closes that gap.
   function fetchWikipediaSuggestions(query, limit) {
+    var signal = function () { return AbortSignal.timeout ? AbortSignal.timeout(8000) : undefined; };
+    var api = function (qs) {
+      return fetch("https://en.wikipedia.org/w/api.php?format=json&origin=*&" + qs, { signal: signal() })
+        .then(function (r) { return r.json(); });
+    };
+    var pagesOf = function (data) {
+      var pages = (data.query && data.query.pages) || {};
+      return Object.keys(pages).map(function (k) { return pages[k]; });
+    };
+    var isUsable = function (p) {
+      return !!(p && p.thumbnail && p.thumbnail.source &&
+        !(p.pageprops && "disambiguation" in p.pageprops) &&
+        !/^list of /i.test(p.title));
+    };
+    var q = query.trim().toLowerCase();
+    var titleMatchesQuery = function (title) { return q.length > 0 && title.toLowerCase().indexOf(q) !== -1; };
+    var pageProps = "prop=pageimages%7Cpageprops&piprop=thumbnail&pithumbsize=300&ppprop=disambiguation";
+
+    var exactUrl = "action=query&redirects=1&" + pageProps + "&titles=" + encodeURIComponent(query);
+    return api(exactUrl).then(function (data) {
+      var page = pagesOf(data)[0];
+      return isUsable(page) ? [{ title: page.title, thumbUrl: page.thumbnail.source }] : [];
+    }).catch(function () { return []; }).then(function (primary) {
+      if (primary.length >= limit) return primary;
+
+      var searchUrl = "action=query&generator=search&gsrnamespace=0&gsrlimit=" + (limit * 2) + "&" + pageProps +
+        "&gsrsearch=" + encodeURIComponent("intitle:" + query);
+      return api(searchUrl).then(function (data) {
+        var extra = pagesOf(data)
+          .sort(function (a, b) { return (a.index || 0) - (b.index || 0); })
+          .filter(function (p) {
+            return isUsable(p) && titleMatchesQuery(p.title) &&
+              !primary.some(function (s) { return s.title === p.title; });
+          })
+          .map(function (p) { return { title: p.title, thumbUrl: p.thumbnail.source }; });
+        return primary.concat(extra).slice(0, limit);
+      }).catch(function () { return primary; });
+    });
+  }
+
+  // Openverse (openverse.org) indexes hundreds of millions of openly
+  // licensed photos from Flickr, Wikimedia Commons, museums etc. — far more
+  // real-photo variety than Wikipedia lead images. Keyless and CORS-enabled,
+  // and its /thumb/ endpoint is a CORS-enabled proxy, so the blob can be
+  // fetched and re-uploaded. Anonymous use is rate limited (20/min,
+  // 200/day), so failures fall back to Wikipedia.
+  function fetchOpenverseSuggestions(query, limit) {
     var signal = AbortSignal.timeout ? AbortSignal.timeout(8000) : undefined;
-    var searchUrl = "https://en.wikipedia.org/w/api.php?action=query&list=search&format=json&origin=*&srlimit=" + limit + "&srsearch=" + encodeURIComponent(query);
-    return fetch(searchUrl, { signal: signal }).then(function (r) { return r.json(); }).then(function (data) {
-      var titles = ((data.query && data.query.search) || []).map(function (h) { return h.title; });
-      if (!titles.length) return [];
-      var imgUrl = "https://en.wikipedia.org/w/api.php?action=query&prop=pageimages&piprop=thumbnail&pithumbsize=300&format=json&origin=*&titles=" + encodeURIComponent(titles.join("|"));
-      return fetch(imgUrl, { signal: signal }).then(function (r) { return r.json(); }).then(function (data2) {
-        var pages = (data2.query && data2.query.pages) || {};
-        var thumbByTitle = {};
-        Object.keys(pages).forEach(function (k) {
-          var p = pages[k];
-          if (p && p.thumbnail && p.thumbnail.source) thumbByTitle[p.title] = p.thumbnail.source;
-        });
-        return titles.filter(function (t) { return thumbByTitle[t]; })
-          .map(function (t) { return { title: t, thumbUrl: thumbByTitle[t] }; });
+    var url = "https://api.openverse.org/v1/images/?mature=false&category=photograph&page_size=" + (limit * 3) +
+      "&q=" + encodeURIComponent(query);
+    return fetch(url, { signal: signal }).then(function (r) {
+      if (!r.ok) throw new Error("openverse " + r.status);
+      return r.json();
+    }).then(function (data) {
+      var seen = {};
+      return (data.results || []).filter(function (r) {
+        if (!r.thumbnail || (r.unstable__sensitivity && r.unstable__sensitivity.length)) return false;
+        // Same photo is often indexed twice (e.g. Flickr + Commons).
+        var key = (r.title || "") + "|" + (r.creator || "") + "|" + r.width + "x" + r.height;
+        if (seen[key]) return false;
+        seen[key] = true;
+        return true;
+      }).slice(0, limit).map(function (r) {
+        return { title: r.title || query, thumbUrl: r.thumbnail };
       });
+    });
+  }
+
+  // Openverse first; Wikipedia when it's unavailable or finds nothing.
+  function fetchPhotoSuggestions(query, limit) {
+    return fetchOpenverseSuggestions(query, limit).catch(function () { return []; }).then(function (hits) {
+      return hits.length ? hits : fetchWikipediaSuggestions(query, limit);
     });
   }
 
@@ -591,7 +658,7 @@
     state.autoImageStatus = "searching";
     refreshImgDropOnly();
 
-    var search = meaning ? fetchWikipediaSuggestions(meaning, 5).catch(function () { return []; }) : Promise.resolve([]);
+    var search = meaning ? fetchPhotoSuggestions(meaning, 5).catch(function () { return []; }) : Promise.resolve([]);
 
     search.then(function (hits) {
       if (stale()) return null;
