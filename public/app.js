@@ -615,10 +615,97 @@
     });
   }
 
-  // Openverse first; Wikipedia when it's unavailable or finds nothing.
-  function fetchPhotoSuggestions(query, limit) {
-    return fetchOpenverseSuggestions(query, limit).catch(function () { return []; }).then(function (hits) {
-      return hits.length ? hits : fetchWikipediaSuggestions(query, limit);
+  function detectLang(s) {
+    if (/[Ѐ-ӿ]/.test(s)) return "ru";
+    if (/[぀-ヿ一-鿿]/.test(s)) return "ja";
+    return "en";
+  }
+
+  function wikidataApi(qs) {
+    var signal = AbortSignal.timeout ? AbortSignal.timeout(8000) : undefined;
+    return fetch("https://www.wikidata.org/w/api.php?format=json&origin=*&" + qs, { signal: signal })
+      .then(function (r) { return r.json(); });
+  }
+
+  function toKatakana(s) {
+    return s.replace(/[ぁ-ゖ]/g, function (c) { return String.fromCharCode(c.charCodeAt(0) + 0x60); });
+  }
+
+  // wbsearchentities is a prefix search ("bat" -> "Bath" first), so hits
+  // whose label/alias equals the term exactly are kept separately.
+  function wikidataSearch(term, lang) {
+    var empty = { exact: [], all: [] };
+    if (!term) return Promise.resolve(empty);
+    var t = term.toLowerCase();
+    return wikidataApi("action=wbsearchentities&type=item&limit=20&uselang=en&language=" + lang +
+      "&search=" + encodeURIComponent(term))
+      .then(function (d) {
+        var hits = d.search || [];
+        return {
+          exact: hits.filter(function (h) { return h.match && h.match.text.toLowerCase() === t; }).map(function (h) { return h.id; }),
+          all: hits.map(function (h) { return h.id; })
+        };
+      })
+      .catch(function () { return empty; });
+  }
+
+  // Searching photo sites with the raw meaning goes wrong whenever it isn't
+  // English: "Цветы" matched the Russian band "Tsvety" and Flickr captions
+  // that merely mention flowers. So first resolve the word to a Wikidata
+  // concept — preferring one that matches both the Japanese word and the
+  // meaning (花 + "Цветы" -> Q506 "flower") — and search by its English
+  // label. The concept's own main image (P18) makes the best first pick.
+  function resolveConcept(jp, meaning) {
+    // Kana words are often labelled in katakana only (こうもり -> コウモリ).
+    var kata = toKatakana(jp);
+    return Promise.all([
+      wikidataSearch(jp, "ja"),
+      kata !== jp ? wikidataSearch(kata, "ja") : { exact: [], all: [] },
+      wikidataSearch(meaning, detectLang(meaning))
+    ]).then(function (res) {
+      var jpExact = res[0].exact.concat(res[1].exact), jpAll = res[0].all.concat(res[1].all);
+      var m = res[2];
+      var both = m.all.filter(function (id) { return jpAll.indexOf(id) !== -1; });
+      var id = both[0] || m.exact[0] || jpExact[0] || m.all[0] || jpAll[0];
+      if (!id) return null;
+      return wikidataApi("action=wbgetentities&props=labels%7Cclaims&languages=en&ids=" + id).then(function (d) {
+        var e = d.entities && d.entities[id];
+        if (!e) return null;
+        var p18 = e.claims && e.claims.P18 && e.claims.P18[0];
+        return {
+          label: e.labels && e.labels.en ? e.labels.en.value : null,
+          imageFile: p18 && p18.mainsnak.datavalue ? p18.mainsnak.datavalue.value : null
+        };
+      });
+    }).catch(function () { return null; });
+  }
+
+  function fetchCommonsThumb(file) {
+    var signal = AbortSignal.timeout ? AbortSignal.timeout(8000) : undefined;
+    var url = "https://commons.wikimedia.org/w/api.php?action=query&format=json&origin=*&prop=imageinfo&iiprop=url&iiurlwidth=300&titles=" +
+      encodeURIComponent("File:" + file);
+    return fetch(url, { signal: signal }).then(function (r) { return r.json(); }).then(function (d) {
+      var pages = (d.query && d.query.pages) || {};
+      var p = pages[Object.keys(pages)[0]];
+      var info = p && p.imageinfo && p.imageinfo[0];
+      return info && info.thumburl ? { title: file.replace(/\.[^.]+$/, ""), thumbUrl: info.thumburl } : null;
+    }).catch(function () { return null; });
+  }
+
+  // Concept image first, then Openverse photos for the English label;
+  // Wikipedia only when both come up empty.
+  function fetchPhotoSuggestions(jp, meaning, limit) {
+    return resolveConcept(jp, meaning).then(function (concept) {
+      // An English meaning is already the user's own best query; the
+      // concept label ("Chiroptera" for "bat") is for other languages.
+      var query = (meaning && detectLang(meaning) === "en") ? meaning : ((concept && concept.label) || meaning || jp);
+      return Promise.all([
+        concept && concept.imageFile ? fetchCommonsThumb(concept.imageFile) : null,
+        fetchOpenverseSuggestions(query, limit).catch(function () { return []; })
+      ]).then(function (res) {
+        var hits = (res[0] ? [res[0]] : []).concat(res[1]).slice(0, limit);
+        return hits.length ? hits : fetchWikipediaSuggestions(query, limit);
+      });
     });
   }
 
@@ -658,7 +745,7 @@
     state.autoImageStatus = "searching";
     refreshImgDropOnly();
 
-    var search = meaning ? fetchPhotoSuggestions(meaning, 5).catch(function () { return []; }) : Promise.resolve([]);
+    var search = fetchPhotoSuggestions(jp, meaning, 5).catch(function () { return []; });
 
     search.then(function (hits) {
       if (stale()) return null;
